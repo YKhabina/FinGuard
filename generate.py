@@ -1,3 +1,4 @@
+python
 """
 Финтех-пайплайн: генерация данных + Kafka (три независимых потока).
 
@@ -7,13 +8,13 @@
     python main.py generate               # только сгенерировать JSONL
     python main.py produce                # только отправить в Kafka
     python main.py produce --only transactions --rate-tx 100
-    python main.py all --rate-dev 2 --rate-auth 50 --rate-tx 200
 
 Конфигурация — только из окружения (см. config.py и .env.example).
 Никаких паролей и хостов в этом файле нет.
 """
 import argparse
 import json
+import math
 import random
 import signal
 import sys
@@ -50,7 +51,12 @@ N_MERCHANTS      = 2_000
 N_TRANSACTIONS   = 500_000
 N_AUTHORIZATIONS = 300_000
 N_DEVICE_EVENTS  = 100_000
-FRAUD_RATE       = 0.04
+
+# ВАЖНО: это доля «инцидентов», а не транзакций.
+# Инцидент = пачка из 1..15 транзакций. Фактическая доля транзакций
+# получается ≈ FRAUD_RATE * avg_batch_size. При 1.2% и среднем размере
+# пачки ~3.3 получаем ≈ 4% транзакций — как в задании.
+FRAUD_RATE = 0.012
 
 # ---------- Домены ----------
 CARD_TYPES    = ["debit", "credit", "virtual", "prepaid"]
@@ -60,7 +66,6 @@ DEVICE_TYPES  = ["mobile", "tablet", "desktop"]
 DEVICE_OS     = ["iOS", "Android", "Windows", "macOS", "Linux"]
 TX_TYPES      = ["purchase", "refund", "transfer", "withdrawal", "topup"]
 TX_STATUSES   = ["approved", "declined", "pending", "reversed"]
-AUTH_RESULTS  = ["approved", "declined", "3ds_challenge", "timeout"]
 COUNTRIES     = ["RU", "KZ", "BY", "TR", "AE", "CN", "DE", "US"]
 CITIES_BY_COUNTRY = {
     "RU": ["Москва", "Санкт-Петербург", "Казань", "Новосибирск", "Екатеринбург"],
@@ -104,7 +109,7 @@ shutdown = threading.Event()
 
 
 def _sigint(*_):
-    print("\n[SIGINT] stopping threads...", file=sys.stderr)
+    print("\n[SIGINT/SIGTERM] stopping threads...", file=sys.stderr)
     shutdown.set()
 
 
@@ -115,10 +120,17 @@ def pid(prefix, n, width):
     return f"{prefix}-{n:0{width}d}"
 
 def iso_z(dt):
-    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    """Всегда UTC, всегда с 'Z'. Naive datetime считаем UTC."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def iso_date(dt):
     return dt.strftime("%Y-%m-%d")
+
+def parse_iso(s):
+    """'YYYY-MM-DDTHH:MM:SSZ' -> aware datetime."""
+    return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
 
 def rand_dt():
     delta = END - START
@@ -132,6 +144,11 @@ def dump_jsonl(rows, path: Path):
 
 def key_for(topic, payload):
     return str(payload.get(KEY_FIELD[topic], ""))
+
+def _sample(lst, k):
+    """Безопасная случайная выборка (не больше длины)."""
+    k = max(1, min(k, len(lst)))
+    return random.sample(lst, k=k)
 
 
 # ============================================================
@@ -156,52 +173,87 @@ def gen_clients(n):
 
 
 def gen_accounts(n, clients):
-    ids = [c["client_id"] for c in clients]
-    return [{
-        "account_id": pid("account", random.randint(1, 999_999), 6),
-        "client_id": random.choice(ids),
-        "currency": "RUB",
-        "opened_at": iso_date(rand_dt()),
-    } for _ in range(n)]
-
-
-def gen_cards(n, clients):
+    """FIX #1: уникальность account_id через used-множество."""
     ids = [c["client_id"] for c in clients]
     used = set(); out = []
-    for _ in range(n):
+    # гарантируем каждому клиенту минимум один счёт
+    for cid in ids:
         while True:
-            cid = pid("card", random.randint(1, 99_999), 5)
-            if cid not in used:
-                used.add(cid); break
-        issued = rand_dt()
+            aid = pid("account", random.randint(1, 999_999), 6)
+            if aid not in used:
+                used.add(aid); break
         out.append({
-            "card_id": cid,
+            "account_id": aid,
+            "client_id": cid,
+            "currency": "RUB",
+            "opened_at": iso_date(rand_dt()),
+        })
+    # остальные счета — случайным клиентам
+    while len(out) < n:
+        while True:
+            aid = pid("account", random.randint(1, 999_999), 6)
+            if aid not in used:
+                used.add(aid); break
+        out.append({
+            "account_id": aid,
             "client_id": random.choice(ids),
-            "card_type": random.choice(CARD_TYPES),
-            "payment_system": random.choice(PAY_SYSTEMS),
-            "status": random.choices(CARD_STATUSES, weights=[.9,.06,.03,.01])[0],
-            "issued_at": iso_date(issued),
-            "expires_at": iso_date(issued + timedelta(days=365*random.randint(3,5))),
+            "currency": "RUB",
+            "opened_at": iso_date(rand_dt()),
         })
     return out
 
 
-def gen_devices(n, clients):
+def _make_card(cid, used):
+    while True:
+        card_id = pid("card", random.randint(1, 99_999), 5)
+        if card_id not in used:
+            used.add(card_id); break
+    issued = rand_dt()
+    return {
+        "card_id": card_id,
+        "client_id": cid,
+        "card_type": random.choice(CARD_TYPES),
+        "payment_system": random.choice(PAY_SYSTEMS),
+        "status": random.choices(CARD_STATUSES, weights=[.9,.06,.03,.01])[0],
+        "issued_at": iso_date(issued),
+        "expires_at": iso_date(issued + timedelta(days=365*random.randint(3,5))),
+    }
+
+
+def gen_cards(n, clients):
+    """FIX #2: каждому клиенту гарантированно ≥1 карта."""
     ids = [c["client_id"] for c in clients]
     used = set(); out = []
-    for _ in range(n):
-        while True:
-            did = pid("device", random.randint(1, 99_999), 5)
-            if did not in used:
-                used.add(did); break
-        out.append({
-            "device_id": did,
-            "client_id": random.choice(ids),
-            "device_type": random.choice(DEVICE_TYPES),
-            "os": random.choice(DEVICE_OS),
-            "trusted": random.random() < 0.8,
-            "first_seen_at": iso_z(rand_dt()),
-        })
+    for cid in ids:
+        out.append(_make_card(cid, used))
+    while len(out) < n:
+        out.append(_make_card(random.choice(ids), used))
+    return out
+
+
+def _make_device(cid, used):
+    while True:
+        did = pid("device", random.randint(1, 99_999), 5)
+        if did not in used:
+            used.add(did); break
+    return {
+        "device_id": did,
+        "client_id": cid,
+        "device_type": random.choice(DEVICE_TYPES),
+        "os": random.choice(DEVICE_OS),
+        "trusted": random.random() < 0.8,
+        "first_seen_at": iso_z(rand_dt()),
+    }
+
+
+def gen_devices(n, clients):
+    """FIX #2: каждому клиенту гарантированно ≥1 устройство."""
+    ids = [c["client_id"] for c in clients]
+    used = set(); out = []
+    for cid in ids:
+        out.append(_make_device(cid, used))
+    while len(out) < n:
+        out.append(_make_device(random.choice(ids), used))
     return out
 
 
@@ -209,7 +261,7 @@ def gen_merchants(n):
     used = set(); out = []
     for _ in range(n):
         while True:
-            mid = pid("merchant", random.randint(1, 9_999), 4)
+            mid = pid("merchant", random.randint(1, 99_999), 5)
             if mid not in used:
                 used.add(mid); break
         country = random.choice(COUNTRIES)
@@ -228,6 +280,8 @@ def gen_merchants(n):
 # 3. Профили и транзакции
 # ============================================================
 def build_profiles(clients, cards, devices):
+    """FIX #3: random.sample вместо [:k] — «обычные» карты/устройства
+    не привязаны к порядку появления в списке."""
     cards_by_cl, devices_by_cl = defaultdict(list), defaultdict(list)
     for c in cards:   cards_by_cl[c["client_id"]].append(c["card_id"])
     for d in devices: devices_by_cl[d["client_id"]].append(d["device_id"])
@@ -259,8 +313,10 @@ def build_profiles(clients, cards, devices):
             "usual_countries": usual_countries,
             "usual_cities": usual_cities,
             "usual_hours": usual_hours,
-            "usual_devices": devices_by_cl[cid][: random.randint(1, len(devices_by_cl[cid]))],
-            "usual_cards":   cards_by_cl[cid][: random.randint(1, len(cards_by_cl[cid]))],
+            "usual_devices": _sample(devices_by_cl[cid],
+                                     random.randint(1, len(devices_by_cl[cid]))),
+            "usual_cards":   _sample(cards_by_cl[cid],
+                                     random.randint(1, len(cards_by_cl[cid]))),
             "transactions_per_day": tpd,
         }
     return profiles
@@ -276,14 +332,23 @@ def sample_usual_hour(usual_hours):
     return random.randint(s, 23) if random.random() < 0.6 else random.randint(0, e)
 
 
+def _lognormal_amount(avg):
+    """FIX #4: логнормальное распределение с заданным средним.
+    Нет «прилипания» к 50 ₽, как у gauss."""
+    # для lognormal: median = exp(mu), mean = exp(mu + sigma^2/2)
+    # фиксируем sigma=0.6, подбираем mu так, чтобы mean == avg
+    sigma = 0.6
+    mu = math.log(max(avg, 1.0)) - 0.5 * sigma * sigma
+    return round(random.lognormvariate(mu, sigma), 2)
+
+
 def usual_transaction(client_id, profile, merchants_by_id, merchant_ids, tx_idx):
     hour = sample_usual_hour(profile["usual_hours"])
     delta_days = (END.date() - START.date()).days
     day = START + timedelta(days=random.randint(0, delta_days))
     dt = day.replace(hour=hour, minute=random.randint(0,59), second=random.randint(0,59))
 
-    amount = max(50.0, round(random.gauss(profile["avg_transaction_amount"],
-                                          profile["avg_transaction_amount"] * 0.6), 2))
+    amount = max(50.0, _lognormal_amount(profile["avg_transaction_amount"]))
     country = random.choice(profile["usual_countries"])
     if country == "RU":
         city = random.choice(CITIES_BY_COUNTRY["RU"]) if random.random() < 0.3 \
@@ -309,9 +374,17 @@ def usual_transaction(client_id, profile, merchants_by_id, merchant_ids, tx_idx)
     }
 
 
-ANOMALY_TYPES = ["rapid_transactions","unusual_country","new_device","large_amount",
-                 "night_activity","multiple_declines","cashout_pattern","account_takeover_pattern"]
-ANOMALY_WEIGHTS = [0.15,0.15,0.12,0.12,0.10,0.10,0.13,0.13]
+ANOMALY_TYPES = [
+    "rapid_transactions",
+    "unusual_country",
+    "new_device",
+    "large_amount",
+    "night_activity",
+    "card_testing",               # FIX #26: было multiple_declines
+    "cashout_pattern",
+    "account_takeover_pattern",
+]
+ANOMALY_WEIGHTS = [0.15, 0.13, 0.12, 0.12, 0.10, 0.12, 0.13, 0.13]
 
 
 def _base_tx(client_id, profile, merchants_by_id, merchant_ids, tx_idx, dt,
@@ -332,122 +405,185 @@ def _base_tx(client_id, profile, merchants_by_id, merchant_ids, tx_idx, dt,
         "status": status,
     }
 
-def _unusual_dt(profile):
-    base = rand_dt()
-    if is_hour_usual(base.hour, profile["usual_hours"]):
-        bad = [h for h in range(24) if not is_hour_usual(h, profile["usual_hours"])]
-        base = base.replace(hour=random.choice(bad))
-    return base
-
 def _unusual_country(profile):
     return random.choice([c for c in COUNTRIES if c not in profile["usual_countries"]])
 
 
-def gen_anomaly(client_id, profile, merchants_by_id, merchant_ids, new_device_pool, tx_idx):
+def gen_anomaly(client_id, profile, merchants_by_id, merchant_ids,
+                new_device_pool, tx_idx):
+    """
+    Возвращает (txs, next_idx, kind).
+    FIX #9: next_idx явно, чтобы не полагаться на len(txs) у вызывающего.
+    """
     kind = random.choices(ANOMALY_TYPES, weights=ANOMALY_WEIGHTS)[0]
-    base_dt = rand_dt(); txs = []
+    base_dt = rand_dt()
+    txs = []
+    idx = tx_idx
+
+    def add(tx):
+        nonlocal idx
+        txs.append(tx)
+        idx += 1
 
     if kind == "rapid_transactions":
-        for k in range(random.randint(3, 6)):
-            txs.append(_base_tx(client_id, profile, merchants_by_id, merchant_ids,
-                                tx_idx+k, base_dt+timedelta(seconds=random.randint(30,180)*k),
-                                amount=random.uniform(100, 5000),
-                                country=random.choice(profile["usual_countries"]),
-                                city=random.choice(profile["usual_cities"]),
-                                device_id=random.choice(profile["usual_devices"])))
+        # FIX #24: 11–15 операций за <5 минут — реально триггерит Velocity
+        n = random.randint(11, 15)
+        for k in range(n):
+            dt = base_dt + timedelta(seconds=random.randint(1, 25) * k)
+            add(_base_tx(client_id, profile, merchants_by_id, merchant_ids,
+                         idx, dt, amount=random.uniform(100, 5000),
+                         country=random.choice(profile["usual_countries"]),
+                         city=random.choice(profile["usual_cities"]),
+                         device_id=random.choice(profile["usual_devices"])))
+
     elif kind == "unusual_country":
         c = _unusual_country(profile)
-        txs.append(_base_tx(client_id, profile, merchants_by_id, merchant_ids, tx_idx,
-                            base_dt, random.uniform(2000, 30000), c,
-                            random.choice(CITIES_BY_COUNTRY[c]),
-                            random.choice(profile["usual_devices"])))
+        add(_base_tx(client_id, profile, merchants_by_id, merchant_ids, idx,
+                     base_dt, random.uniform(2000, 30000), c,
+                     random.choice(CITIES_BY_COUNTRY[c]),
+                     random.choice(profile["usual_devices"])))
+
     elif kind == "new_device":
-        txs.append(_base_tx(client_id, profile, merchants_by_id, merchant_ids, tx_idx,
-                            base_dt, random.uniform(1000, 20000),
-                            random.choice(profile["usual_countries"]),
-                            random.choice(profile["usual_cities"]),
-                            random.choice(new_device_pool)))
+        add(_base_tx(client_id, profile, merchants_by_id, merchant_ids, idx,
+                     base_dt, random.uniform(1000, 20000),
+                     random.choice(profile["usual_countries"]),
+                     random.choice(profile["usual_cities"]),
+                     random.choice(new_device_pool)))
+
     elif kind == "large_amount":
-        txs.append(_base_tx(client_id, profile, merchants_by_id, merchant_ids, tx_idx,
-                            base_dt,
-                            round(profile["avg_transaction_amount"]*random.uniform(10,30),2),
-                            random.choice(profile["usual_countries"]),
-                            random.choice(profile["usual_cities"]),
-                            random.choice(profile["usual_devices"])))
+        add(_base_tx(client_id, profile, merchants_by_id, merchant_ids, idx,
+                     base_dt,
+                     round(profile["avg_transaction_amount"] * random.uniform(10, 30), 2),
+                     random.choice(profile["usual_countries"]),
+                     random.choice(profile["usual_cities"]),
+                     random.choice(profile["usual_devices"])))
+
     elif kind == "night_activity":
-        txs.append(_base_tx(client_id, profile, merchants_by_id, merchant_ids, tx_idx,
-                            _unusual_dt(profile), random.uniform(500, 15000),
-                            random.choice(profile["usual_countries"]),
-                            random.choice(profile["usual_cities"]),
-                            random.choice(profile["usual_devices"])))
-    elif kind == "multiple_declines":
-        for k in range(random.randint(3, 5)):
-            txs.append(_base_tx(client_id, profile, merchants_by_id, merchant_ids,
-                                tx_idx+k, base_dt+timedelta(minutes=k*2),
-                                random.uniform(500, 5000),
-                                random.choice(profile["usual_countries"]),
-                                random.choice(profile["usual_cities"]),
-                                random.choice(profile["usual_devices"]),
-                                status="declined"))
+        # FIX #13: фиксированное ночное окно 02:00–04:59, а не «нетипичное для профиля»
+        dt = base_dt.replace(hour=random.choice([2, 3, 4]),
+                             minute=random.randint(0, 59),
+                             second=random.randint(0, 59))
+        add(_base_tx(client_id, profile, merchants_by_id, merchant_ids, idx,
+                     dt, random.uniform(500, 15000),
+                     random.choice(profile["usual_countries"]),
+                     random.choice(profile["usual_cities"]),
+                     random.choice(profile["usual_devices"])))
+
+    elif kind == "card_testing":
+        # FIX #26: 3–5 мелких declined → 1 крупный approved
+        n_decl = random.randint(3, 5)
+        for k in range(n_decl):
+            add(_base_tx(client_id, profile, merchants_by_id, merchant_ids,
+                         idx, base_dt + timedelta(seconds=random.randint(30, 90) * k),
+                         amount=random.uniform(50, 500),
+                         country=random.choice(profile["usual_countries"]),
+                         city=random.choice(profile["usual_cities"]),
+                         device_id=random.choice(profile["usual_devices"]),
+                         status="declined"))
+        add(_base_tx(client_id, profile, merchants_by_id, merchant_ids,
+                     idx, base_dt + timedelta(seconds=random.randint(400, 600)),
+                     amount=random.uniform(50_000, 100_000),
+                     country=random.choice(profile["usual_countries"]),
+                     city=random.choice(profile["usual_cities"]),
+                     device_id=random.choice(profile["usual_devices"]),
+                     status="approved"))
+
     elif kind == "cashout_pattern":
-        dt = _unusual_dt(profile)
-        for k in range(random.randint(2, 4)):
-            txs.append(_base_tx(client_id, profile, merchants_by_id, merchant_ids,
-                                tx_idx+k, dt+timedelta(minutes=15*k),
-                                random.uniform(20_000, 100_000),
-                                random.choice(profile["usual_countries"]),
-                                random.choice(profile["usual_cities"]),
-                                random.choice(profile["usual_devices"]),
-                                tx_type="withdrawal"))
-    else:  # account_takeover_pattern
+        # FIX #14: нетипичная локация + новое устройство + серия снятий
+        c = _unusual_country(profile)
+        city = random.choice(CITIES_BY_COUNTRY[c])
         dev = random.choice(new_device_pool)
-        c = _unusual_country(profile); city = random.choice(CITIES_BY_COUNTRY[c])
-        txs.append(_base_tx(client_id, profile, merchants_by_id, merchant_ids, tx_idx,
-                            base_dt, 500.0, c, city, dev, status="declined"))
-        for k in range(1, random.randint(2, 4)):
-            txs.append(_base_tx(client_id, profile, merchants_by_id, merchant_ids,
-                                tx_idx+k, base_dt+timedelta(minutes=3*k),
-                                round(profile["avg_transaction_amount"]*random.uniform(20,60),2),
-                                c, city, dev))
-    return txs, kind
+        for k in range(random.randint(2, 4)):
+            add(_base_tx(client_id, profile, merchants_by_id, merchant_ids,
+                         idx, base_dt + timedelta(minutes=15 * k),
+                         amount=random.uniform(20_000, 100_000),
+                         country=c, city=city, device_id=dev,
+                         tx_type="withdrawal", status="approved"))
+
+    else:  # account_takeover_pattern
+        # FIX #25: обычные → атака с нового устройства в чужой стране → крупные суммы
+        # 1) две обычные транзакции до атаки
+        for k in range(2):
+            add(_base_tx(client_id, profile, merchants_by_id, merchant_ids, idx,
+                         base_dt + timedelta(minutes=random.randint(1, 5) * k),
+                         amount=random.uniform(100, 3000),
+                         country=random.choice(profile["usual_countries"]),
+                         city=random.choice(profile["usual_cities"]),
+                         device_id=random.choice(profile["usual_devices"])))
+        # 2) «вход» с нового устройства в нетипичной стране
+        attack_dt = base_dt + timedelta(minutes=random.randint(8, 15))
+        c = _unusual_country(profile)
+        city = random.choice(CITIES_BY_COUNTRY[c])
+        dev = random.choice(new_device_pool)
+        add(_base_tx(client_id, profile, merchants_by_id, merchant_ids, idx,
+                     attack_dt, amount=random.uniform(100, 500),
+                     country=c, city=city, device_id=dev, status="declined"))
+        # 3) крупные операции
+        for k in range(1, random.randint(3, 5)):
+            add(_base_tx(client_id, profile, merchants_by_id, merchant_ids, idx,
+                         attack_dt + timedelta(minutes=random.randint(2, 5) * k),
+                         amount=round(profile["avg_transaction_amount"]
+                                      * random.uniform(20, 60), 2),
+                         country=c, city=city, device_id=dev,
+                         status="approved"))
+        # 4) финальный перевод
+        add(_base_tx(client_id, profile, merchants_by_id, merchant_ids, idx,
+                     attack_dt + timedelta(minutes=random.randint(15, 25)),
+                     amount=random.uniform(80_000, 200_000),
+                     country=c, city=city, device_id=dev,
+                     tx_type="transfer", status="approved"))
+
+    return txs, idx, kind
 
 
 def gen_transactions(profiles, merchants, devices, n_total):
+    # FIX #8: проверка на пустоту
+    if not profiles:
+        raise RuntimeError("profiles пуст — проверьте генерацию карт/устройств")
+
     merchants_by_id = {m["merchant_id"]: m for m in merchants}
     merchant_ids = list(merchants_by_id.keys())
     all_devices = [d["device_id"] for d in devices]
 
     def new_device_for(profile):
         usual = set(profile["usual_devices"])
-        return random.choice([d for d in all_devices if d not in usual])
+        pool = [d for d in all_devices if d not in usual]
+        if not pool:
+            return random.choice(all_devices)
+        return random.choice(pool)
 
     client_ids = list(profiles.keys())
     tx_rows, labels, batches = [], [], []
-    normal = 0; idx = 1
+    normal = 0
+    idx = 1
 
     while len(tx_rows) < n_total:
         cid = random.choice(client_ids)
         profile = profiles[cid]
         if random.random() < FRAUD_RATE:
-            txs, kind = gen_anomaly(cid, profile, merchants_by_id, merchant_ids,
-                                    [new_device_for(profile)], idx)
+            txs, idx, kind = gen_anomaly(
+                cid, profile, merchants_by_id, merchant_ids,
+                [new_device_for(profile)], idx,
+            )
             for t in txs:
                 tx_rows.append(t)
                 labels.append({"transaction_id": t["transaction_id"],
                                "client_id": cid, "fraud": True, "anomaly_type": kind})
             batches.append({"client_id": cid, "anomaly_type": kind,
                             "transaction_ids": [t["transaction_id"] for t in txs]})
-            idx += len(txs)
         else:
             t = usual_transaction(cid, profile, merchants_by_id, merchant_ids, idx)
             tx_rows.append(t)
             labels.append({"transaction_id": t["transaction_id"],
                            "client_id": cid, "fraud": False, "anomaly_type": None})
-            normal += 1; idx += 1
+            normal += 1
+            idx += 1
 
     tx_rows, labels = tx_rows[:n_total], labels[:n_total]
-    print(f"  transactions: normal={normal}, "
-          f"anomalies={len(tx_rows)-normal} ({(len(tx_rows)-normal)/len(tx_rows)*100:.2f}%)")
+    # пересчитываем фактическую долю по обрезанному массиву
+    fraud_tx = sum(1 for l in labels if l["fraud"])
+    print(f"  transactions: normal={len(labels)-fraud_tx}, "
+          f"anomalies={fraud_tx} ({fraud_tx/len(labels)*100:.2f}%)")
     return tx_rows, labels, batches
 
 
@@ -466,15 +602,28 @@ def gen_authorizations(n, tx_rows, devices):
         tx = tx_by_id[random.choice(tx_ids)]
         device_id = tx.get("device_id") or random.choice(dev_by_client[tx["client_id"]])
 
+        # FIX #6: risk_score согласован со статусом
         if tx["status"] == "approved":
             result = random.choices(["approved","3ds_challenge"], weights=[.93,.07])[0]
             code = "00"
+            risk = round(random.betavariate(2, 8), 4)       # смещено к 0
         elif tx["status"] == "declined":
             result = random.choices(["declined","timeout"], weights=[.85,.15])[0]
             code = random.choice(["05","51","54","91"])
+            risk = round(random.betavariate(8, 2), 4)       # смещено к 1
         else:
             result = random.choices(["approved","timeout","declined"], weights=[.6,.3,.1])[0]
             code = "00" if result == "approved" else "91"
+            risk = round(random.betavariate(5, 5), 4)
+
+        # FIX #16: timeout/3ds_challenge — авторизация позже транзакции
+        tx_dt = parse_iso(tx["event_datetime"])
+        if result == "timeout":
+            auth_dt = tx_dt + timedelta(seconds=random.randint(30, 120))
+        elif result == "3ds_challenge":
+            auth_dt = tx_dt + timedelta(seconds=random.randint(5, 30))
+        else:
+            auth_dt = tx_dt
 
         out.append({
             "authorization_id": pid("auth", i+1, 8),
@@ -482,9 +631,9 @@ def gen_authorizations(n, tx_rows, devices):
             "device_id": device_id,
             "result": result,
             "response_code": code,
-            "risk_score": round(random.uniform(0, 1), 4),
+            "risk_score": risk,
             "is_3ds": random.random() < 0.6,
-            "created_at": tx["event_datetime"],
+            "created_at": iso_z(auth_dt),
         })
     return out
 
@@ -492,22 +641,58 @@ def gen_authorizations(n, tx_rows, devices):
 DEVICE_EVENT_TYPES = ["login","logout","token_refresh","device_added",
                       "device_trusted","device_blocked","push_opened"]
 
+# FIX #7: пул «правдоподобных» IP на страну (для согласованности country ↔ ip)
+IP_POOLS = {
+    "RU": ["95.24.", "178.176.", "213.180.", "77.88."],
+    "KZ": ["2.72.",   "5.34.",    "92.46."],
+    "BY": ["93.84.",  "178.120.", "37.17."],
+    "TR": ["88.255.", "178.233.", "195.87."],
+    "AE": ["94.200.", "217.164.", "185.93."],
+    "CN": ["114.114.", "202.108.", "221.179."],
+    "DE": ["85.214.", "46.4.",    "78.46."],
+    "US": ["8.8.",    "66.102.",  "23.22."],
+}
+
+def _ip_for_country(country):
+    prefix = random.choice(IP_POOLS[country])
+    return f"{prefix}{random.randint(1,254)}.{random.randint(1,254)}"
+
+
 def gen_device_events(n, devices):
     out = []
     for i in range(n):
         d = random.choice(devices)
         ev = random.choices(DEVICE_EVENT_TYPES, weights=[.30,.20,.15,.08,.10,.02,.15])[0]
+        country = random.choices(COUNTRIES,
+                                 weights=[.7,.05,.03,.07,.05,.03,.04,.03])[0]
+        ip = _ip_for_country(country)
+
+        # FIX #23: событие не раньше first_seen_at
+        first_seen = parse_iso(d["first_seen_at"])
+        # случайное время между first_seen и END
+        dt = first_seen + timedelta(seconds=random.randint(
+            0, max(1, int((END - first_seen).total_seconds()))))
+
+        # FIX #15: корректный trusted для device_trusted / device_blocked
+        if ev == "device_trusted":
+            trusted = True
+        elif ev == "device_blocked":
+            trusted = False
+        elif ev in ("login", "token_refresh"):
+            trusted = d["trusted"]
+        else:
+            trusted = None
+
         out.append({
             "event_id": pid("dev-ev", i+1, 8),
             "device_id": d["device_id"],
             "client_id": d["client_id"],
             "event_type": ev,
             "os": d["os"],
-            "ip": fake.ipv4_public() if random.random() < 0.9 else fake.ipv4(),
-            "country": random.choices(["RU","KZ","BY","TR","AE","CN","DE","US"],
-                                      weights=[.7,.05,.03,.07,.05,.03,.04,.03])[0],
-            "event_datetime": iso_z(rand_dt()),
-            "trusted": d["trusted"] if ev in ("login","token_refresh") else None,
+            "ip": ip,
+            "country": country,
+            "event_datetime": iso_z(dt),
+            "trusted": trusted,
         })
     return out
 
@@ -526,161 +711,4 @@ def cmd_topics():
     ]
     if not to_create:
         print("All topics exist."); return
-    for name, fut in admin.create_topics(to_create).items():
-        try:
-            fut.result(); print(f"created: {name}")
-        except Exception as e:
-            print(f"failed: {name}: {e}")
-
-
-# ============================================================
-# 6. Генерация в JSONL
-# ============================================================
-def cmd_generate():
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    print("clients...");         clients = gen_clients(N_CLIENTS)
-    print("accounts...");        accounts = gen_accounts(N_ACCOUNTS, clients)
-    print("cards...");           cards = gen_cards(N_CARDS, clients)
-    print("devices...");         devices = gen_devices(N_DEVICES, clients)
-    print("merchants...");       merchants = gen_merchants(N_MERCHANTS)
-    print("profiles...");        profiles = build_profiles(clients, cards, devices)
-    print("transactions...");    tx, labels, batches = gen_transactions(
-        profiles, merchants, devices, N_TRANSACTIONS)
-    print("authorizations...");  auths = gen_authorizations(N_AUTHORIZATIONS, tx, devices)
-    print("device events...");   dev_ev = gen_device_events(N_DEVICE_EVENTS, devices)
-
-    dump_jsonl(clients,   OUT_DIR / "clients.jsonl")
-    dump_jsonl(accounts,  OUT_DIR / "accounts.jsonl")
-    dump_jsonl(cards,     OUT_DIR / "cards.jsonl")
-    dump_jsonl(devices,   OUT_DIR / "devices.jsonl")
-    dump_jsonl(merchants, OUT_DIR / "merchants.jsonl")
-    dump_jsonl(list(profiles.values()), OUT_DIR / "profiles.jsonl")
-
-    dump_jsonl(tx,     OUT_DIR / "transactions.jsonl")
-    dump_jsonl(auths,  OUT_DIR / "authorizations.jsonl")
-    dump_jsonl(dev_ev, OUT_DIR / "device-events.jsonl")
-
-    dump_jsonl(labels,  OUT_DIR / "labels.jsonl")
-    dump_jsonl(batches, OUT_DIR / "anomaly_batches.jsonl")
-
-    print(f"done: tx={len(tx)} auth={len(auths)} dev_ev={len(dev_ev)}")
-
-
-# ============================================================
-# 7. Kafka: три независимых потока-продюсера
-# ============================================================
-def _make_producer(client_id):
-    return Producer({
-        "bootstrap.servers": BOOTSTRAP,
-        "client.id": client_id,
-        "linger.ms": 20,
-        "batch.size": 32 * 1024,
-        "compression.type": "snappy",
-        "acks": "1",
-        "enable.idempotence": True,
-        "queue.buffering.max.messages": 200_000,
-    })
-
-def _delivery(err, msg):
-    if err is not None:
-        print(f"[{msg.topic()}] delivery ERROR partition={msg.partition()}: {err}",
-              file=sys.stderr)
-
-def _producer_thread(path: Path, topic: str, rate: float, limit):
-    producer = _make_producer(f"producer-{topic}")
-    interval = 1.0 / rate if rate > 0 else 0.0
-    sent = 0; t0 = time.time()
-    print(f"[{topic}] START rate={rate or 'max'} msg/s file={path.name}", file=sys.stderr)
-
-    try:
-        with path.open(encoding="utf-8") as f:
-            for line in f:
-                if shutdown.is_set(): break
-                if not line.strip(): continue
-                payload = json.loads(line)
-                producer.produce(
-                    topic=topic,
-                    key=key_for(topic, payload).encode(),
-                    value=json.dumps(payload, ensure_ascii=False).encode(),
-                    callback=_delivery,
-                )
-                producer.poll(0)
-                sent += 1
-                if limit and sent >= limit: break
-                if interval > 0: time.sleep(interval)
-    except Exception as e:
-        print(f"[{topic}] FATAL: {e}", file=sys.stderr)
-    finally:
-        producer.flush(10)
-        dt = max(time.time() - t0, 1e-6)
-        print(f"[{topic}] STOP: {sent} msgs in {dt:.1f}s ({sent/dt:.1f} msg/s)",
-              file=sys.stderr)
-
-
-def cmd_produce(args):
-    rates = {
-        "device.events":        args.rate_dev,
-        "authorization.events": args.rate_auth,
-        "transaction.events":   args.rate_tx,
-    }
-    only = set(args.only) if args.only else None
-    threads = []
-
-    for stem in STREAM_ORDER:
-        if only and stem not in only:
-            continue
-        path = OUT_DIR / f"{stem}.jsonl"
-        if not path.exists():
-            print(f"[skip] {path} not found", file=sys.stderr); continue
-        topic = FILE_TO_TOPIC[stem]
-        t = threading.Thread(
-            target=_producer_thread,
-            args=(path, topic, rates[topic], args.limit),
-            daemon=False,
-            name=f"thr-{topic}",
-        )
-        t.start()
-        threads.append((topic, t))
-
-    try:
-        for _, t in threads:
-            while t.is_alive():
-                t.join(0.5)
-    except KeyboardInterrupt:
-        shutdown.set()
-        for _, t in threads:
-            t.join(5)
-
-    print("\nAll producer threads stopped.")
-
-
-# ============================================================
-# 8. CLI
-# ============================================================
-def main():
-    ap = argparse.ArgumentParser(description="Финтех-пайплайн: генерация + Kafka")
-    ap.add_argument("command", choices=["all", "topics", "generate", "produce"])
-    ap.add_argument("--only", nargs="*", default=None,
-                    help="device-events authorizations transactions")
-    ap.add_argument("--rate-dev",  type=float, default=DEFAULT_RATES["device.events"])
-    ap.add_argument("--rate-auth", type=float, default=DEFAULT_RATES["authorization.events"])
-    ap.add_argument("--rate-tx",   type=float, default=DEFAULT_RATES["transaction.events"])
-    ap.add_argument("--limit", type=int, default=None,
-                    help="максимум сообщений на поток (для отладки)")
-    args = ap.parse_args()
-
-    if args.command == "topics":
-        cmd_topics()
-    elif args.command == "generate":
-        cmd_generate()
-    elif args.command == "produce":
-        cmd_produce(args)
-    else:  # all
-        cmd_topics()
-        cmd_generate()
-        cmd_produce(args)
-
-
-if __name__ == "__main__":
-    signal.signal(signal.SIGINT, _sigint)
-    main()
+    for
