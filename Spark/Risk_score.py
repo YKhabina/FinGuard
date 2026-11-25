@@ -291,6 +291,31 @@ write_single_parquet(df_final, "risk-analytics", f"client_risk_{date_str}.parque
 df_high = df_final.filter(F.col("risk_score") >= 80)
 if df_high.count() > 0:
     write_single_parquet(df_high, "risk-analytics", f"high_risk_clients_{date_str}.parquet")
+# ============================================================
+# 13. Расследование (часть X) → risk-investigations
+# ============================================================
+df_inv = df_high.withColumn(
+    "probable_scenario",
+    F.when(F.col("cashout_events_30d") > 0, "cashout")
+     .when(
+         (F.col("new_device_large_events_30d") > 0)
+         & (F.col("impossible_travel_events_30d") > 0),
+         "account_takeover",
+     )
+     .when(F.col("card_testing_events_30d") > 0, "card_testing")
+     .when(F.col("high_velocity_events_7d") > 0, "velocity_abuse")
+     .otherwise("other"),
+).withColumn("investigation_date", F.lit(NOW_DATE).cast("date")) \
+ .select(
+    "client_id", "investigation_date", "probable_scenario",
+    "risk_score", "risk_level",
+    "impossible_travel_events_30d", "high_velocity_events_7d",
+    "cashout_events_30d", "new_device_large_events_30d", "card_testing_events_30d",
+ )
 
+if df_inv.count() > 0:
+    print("Запись в MinIO: risk-investigations...")
+    write_single_parquet(df_inv, "risk-investigations", f"investigation_{date_str}.parquet")
+    
 spark.stop()
 print("done")
