@@ -10,9 +10,9 @@ Final project in Data Engineering course 2026 with NovaData
 
 ## Стек технологий
 
-* **Источники:** PostgresSQL, Apache Kafka
+* **Источники:** PostgresSQL, Kafka
 * **Хранилище и обработка:** ClickHouse, PySpark
-* **Оркестрация:** Apache Airflow
+* **Оркестрация:** Airflow
 * **Визуализация:** Grafana
 * **Объектное хранилище:** MinIO 
 * **Инфраструктура:** Docker 
