@@ -31,9 +31,9 @@ SELECT
     arrayJoin(quarantine_reason) AS reason,
     quarantined_at
 FROM raw.quarantine;
-===================================================================
-      INSERT
-===================================================================
+#===================================================================
+# INSERT
+#===================================================================
 INSERT INTO raw.quarantine
     (transaction_id, raw_payload, quarantine_reason, quarantined_at)
 SELECT
