@@ -9,7 +9,13 @@ Final project in Data Engineering course 2026 with NovaData
 на уточнении
 
 ## Стек технологий
- на уточнении
+
+* **Источники:** PostgresSQL, Apache Kafka
+* **Хранилище и обработка:** ClickHouse, PySpark
+* **Оркестрация:** Apache Airflow
+* **Визуализация:** Grafana
+* **Объектное хранилище:** MinIO 
+* **Инфраструктура:** Docker 
 
 ## Команда
 - Юлия Хабина — Data Engineer
