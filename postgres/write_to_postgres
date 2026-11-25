@@ -1,0 +1,320 @@
+"""
+Загрузка справочников из generated/*.jsonl в PostgreSQL.
+
+Особенности:
+  * порядок вставки соблюдает FK: clients → accounts → cards / devices → merchants
+  * идемпотентность: TRUNCATE ... RESTART IDENTITY CASCADE перед загрузкой
+  * быстрая загрузка через COPY ... FROM STDIN
+  * fallback на execute_values (--no-copy) для отладки
+  * опциональная проверка «сирот» (--verify)
+
+Запуск:
+    python load_to_postgres.py
+    python load_to_postgres.py --truncate --verify
+    python load_to_postgres.py --table clients
+    python load_to_postgres.py --no-copy --table cards
+"""
+import argparse
+import csv
+import io
+import json
+import sys
+from pathlib import Path
+
+import psycopg2
+from psycopg2 import sql
+from psycopg2.extras import execute_values
+
+# ---------- Конфигурация из окружения ----------
+from config import PG, PG_SCHEMA as SCHEMA, DATA_DIR
+
+
+# ============================================================
+# 0. Порядок загрузки (parents → children)
+# ============================================================
+LOAD_ORDER = ["clients", "accounts", "cards", "devices", "merchants"]
+
+
+# ============================================================
+# 1. Описание таблиц: JSON-поле → колонка PG + transform
+# ============================================================
+def _as_str(v):  return "" if v is None else str(v)
+def _as_date(v): return "" if v is None else str(v)[:10]      # YYYY-MM-DD
+def _as_ts(v):   return "" if v is None else str(v)           # ISO-Z как есть
+def _as_bool(v): return "" if v is None else ("t" if v else "f")
+def _as_num(v):  return "" if v is None else f"{float(v):.2f}"
+
+TABLES = {
+    "clients": {
+        "file": "clients.jsonl",
+        "columns": [
+            ("client_id",  "client_id",  _as_str),
+            ("created_at", "created_at", _as_date),
+            ("country",    "country",    _as_str),
+            ("city",       "city",       _as_str),
+            ("risk_level", "risk_level", _as_str),
+            ("kyc_status", "kyc_status", _as_str),
+        ],
+        "required": ["client_id"],
+    },
+    "accounts": {
+        "file": "accounts.jsonl",
+        "columns": [
+            ("account_id", "account_id", _as_str),
+            ("client_id",  "client_id",  _as_str),
+            ("currency",   "currency",   _as_str),
+            ("opened_at",  "opened_at",  _as_date),
+        ],
+        "required": ["account_id", "client_id"],
+    },
+    "cards": {
+        "file": "cards.jsonl",
+        "columns": [
+            ("card_id",        "card_id",        _as_str),
+            ("account_id",     "account_id",     _as_str),
+            ("client_id",      "client_id",      _as_str),
+            ("card_type",      "card_type",      _as_str),
+            ("payment_system", "payment_system", _as_str),
+            ("status",         "status",         _as_str),
+            ("issued_at",      "issued_at",      _as_date),
+            ("expires_at",     "expires_at",     _as_date),
+        ],
+        "required": ["card_id", "account_id", "client_id", "expires_at"],
+    },
+    "devices": {
+        "file": "devices.jsonl",
+        "columns": [
+            ("device_id",     "device_id",     _as_str),
+            ("client_id",     "client_id",     _as_str),
+            ("device_type",   "device_type",   _as_str),
+            ("os",            "os",            _as_str),
+            ("trusted",       "trusted",       _as_bool),
+            ("first_seen_at", "first_seen_at", _as_ts),
+        ],
+        "required": ["device_id", "client_id"],
+    },
+    "merchants": {
+        "file": "merchants.jsonl",
+        "columns": [
+            ("merchant_id", "merchant_id", _as_str),
+            ("name",        "name",        _as_str),
+            ("mcc",         "mcc",         _as_str),
+            ("country",     "country",     _as_str),
+            ("city",        "city",        _as_str),
+            ("risk_level",  "risk_level",  _as_str),
+        ],
+        "required": ["merchant_id"],
+    },
+}
+
+
+# ============================================================
+# 2. Чтение JSONL
+# ============================================================
+def read_jsonl(path: Path):
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                yield json.loads(line)
+
+
+# ============================================================
+# 3. COPY FROM STDIN
+# ============================================================
+def copy_via_stdin(conn, table, rows, columns):
+    buf = io.StringIO()
+    writer = csv.writer(buf, delimiter="\t", lineterminator="\n")
+    for rec in rows:
+        writer.writerow([fn(rec.get(json_field)) for json_field, _, fn in columns])
+    buf.seek(0)
+
+    pg_cols = [pg for _, pg, _ in columns]
+    copy_sql = sql.SQL(
+        "COPY {schema}.{table} ({cols}) FROM STDIN "
+        "WITH (FORMAT csv, DELIMITER E'\\t', NULL '', QUOTE '\"')"
+    ).format(
+        schema=sql.Identifier(SCHEMA),
+        table=sql.Identifier(table),
+        cols=sql.SQL(", ").join(sql.Identifier(c) for c in pg_cols),
+    )
+
+    with conn.cursor() as cur:
+        cur.copy_expert(copy_sql, buf)
+    conn.commit()
+
+
+# ============================================================
+# 4. execute_values (fallback / отладка)
+# ============================================================
+def insert_via_execute_values(conn, table, rows, columns, page_size=1000):
+    pg_cols  = [pg for _, pg, _ in columns]
+    template = "(" + ",".join(["%s"] * len(pg_cols)) + ")"
+    insert_sql = sql.SQL("INSERT INTO {schema}.{table} ({cols}) VALUES %s").format(
+        schema=sql.Identifier(SCHEMA),
+        table=sql.Identifier(table),
+        cols=sql.SQL(", ").join(sql.Identifier(c) for c in pg_cols),
+    )
+
+    total, buffer = 0, []
+    with conn.cursor() as cur:
+        for rec in rows:
+            buffer.append(tuple(fn(rec.get(j)) for j, _, fn in columns))
+            if len(buffer) >= page_size:
+                execute_values(cur, insert_sql.as_string(conn), buffer, template=template)
+                total += len(buffer); buffer.clear()
+        if buffer:
+            execute_values(cur, insert_sql.as_string(conn), buffer, template=template)
+            total += len(buffer)
+    conn.commit()
+    return total
+
+
+# ============================================================
+# 5. Вспомогательные операции
+# ============================================================
+def truncate_all(conn, tables):
+    if not tables:
+        return
+    stmt = sql.SQL("TRUNCATE TABLE {names} RESTART IDENTITY CASCADE").format(
+        names=sql.SQL(", ").join(
+            sql.SQL("{}.{}").format(sql.Identifier(SCHEMA), sql.Identifier(t))
+            for t in tables
+        )
+    )
+    with conn.cursor() as cur:
+        cur.execute(stmt)
+    conn.commit()
+    print(f"  truncated: {', '.join(tables)}")
+
+
+def count_rows(conn, table):
+    with conn.cursor() as cur:
+        cur.execute(
+            sql.SQL("SELECT COUNT(*) FROM {}.{}").format(
+                sql.Identifier(SCHEMA), sql.Identifier(table)
+            )
+        )
+        return cur.fetchone()[0]
+
+
+def verify_fk_orphans(conn):
+    checks = [
+        ("accounts.client_id", "accounts", "clients",  "client_id",  "client_id"),
+        ("cards.client_id",    "cards",    "clients",  "client_id",  "client_id"),
+        ("cards.account_id",   "cards",    "accounts", "account_id", "account_id"),
+        ("devices.client_id",  "devices",  "clients",  "client_id",  "client_id"),
+    ]
+    ok = True
+    with conn.cursor() as cur:
+        for label, child, parent, cc, pc in checks:
+            cur.execute(
+                sql.SQL("""
+                    SELECT COUNT(*)
+                    FROM {s}.{c} c
+                    LEFT JOIN {s}.{p} p ON p.{pc} = c.{cc}
+                    WHERE p.{pc} IS NULL
+                """).format(
+                    s=sql.Identifier(SCHEMA),
+                    c=sql.Identifier(child),
+                    p=sql.Identifier(parent),
+                    cc=sql.Identifier(cc),
+                    pc=sql.Identifier(pc),
+                )
+            )
+            n = cur.fetchone()[0]
+            if n:
+                ok = False
+                print(f"  [WARN] {label}: {n} orphans")
+            else:
+                print(f"  [OK]   {label}")
+    return ok
+
+
+# ============================================================
+# 6. Загрузка одной таблицы
+# ============================================================
+def load_table(conn, table, data_dir, use_copy):
+    spec = TABLES[table]
+    path = data_dir / spec["file"]
+    if not path.exists():
+        print(f"  [skip] {path} not found", file=sys.stderr)
+        return 0
+
+    rows = list(read_jsonl(path))
+    if not rows:
+        print(f"  [skip] {path} is empty", file=sys.stderr)
+        return 0
+
+    for i, rec in enumerate(rows):
+        for key in spec["required"]:
+            if rec.get(key) in (None, ""):
+                raise ValueError(
+                    f"{path.name}:{i+1}: missing required field '{key}': {rec}"
+                )
+
+    if use_copy:
+        copy_via_stdin(conn, table, iter(rows), spec["columns"])
+    else:
+        insert_via_execute_values(conn, table, iter(rows), spec["columns"])
+    return len(rows)
+
+
+# ============================================================
+# 7. main
+# ============================================================
+def main():
+    ap = argparse.ArgumentParser(description="Загрузка справочников в PostgreSQL")
+    ap.add_argument("--data-dir", default=str(DATA_DIR))
+    ap.add_argument("--truncate", action="store_true",
+                    help="TRUNCATE перед загрузкой (идемпотентность)")
+    ap.add_argument("--table", choices=LOAD_ORDER, default=None,
+                    help="загрузить только одну таблицу")
+    ap.add_argument("--no-copy", dest="copy", action="store_false",
+                    help="использовать execute_values вместо COPY")
+    ap.add_argument("--verify", action="store_true",
+                    help="проверить «сирот» после загрузки")
+    args = ap.parse_args()
+    args.copy = getattr(args, "copy", True)
+
+    data_dir = Path(args.data_dir)
+    if not data_dir.exists():
+        print(f"ERROR: data dir not found: {data_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    # В логах — только логин@хост/БД, без пароля
+    print(f"Connecting to PostgreSQL: "
+          f"{PG['user']}@{PG['host']}:{PG['port']}/{PG['dbname']} (schema={SCHEMA})")
+
+    conn = psycopg2.connect(**PG)
+    try:
+        tables = [args.table] if args.table else LOAD_ORDER
+
+        if args.truncate:
+            # сначала дети, потом родители
+            truncate_all(conn, list(reversed(tables)))
+
+        total = 0
+        for table in tables:
+            print(f"[load] {table} ...")
+            n = load_table(conn, table, data_dir, use_copy=args.copy)
+            db_n = count_rows(conn, table)
+            print(f"  -> sent={n}, in DB={db_n}")
+            total += n
+
+        print(f"\nDONE: rows sent = {total}")
+
+        if args.verify:
+            print("\nFK verification:")
+            if not verify_fk_orphans(conn):
+                print("  (не все FK чистые — проверьте generated/*.jsonl)")
+
+        print("\nRow counts:")
+        for t in LOAD_ORDER:
+            print(f"  {t:<12} {count_rows(conn, t):>8}")
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    main()
