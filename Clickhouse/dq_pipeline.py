@@ -106,7 +106,7 @@ arrayFilter(x -> x != '', [
 """
 
 INSERT_QUARANTINE = DQ_CTE + f"""
-INSERT INTO raw.quarantine_transactions
+INSERT INTO raw.quarantine
     (transaction_id, raw_payload, quarantine_reason, quarantined_at)
 SELECT
     transaction_id,
@@ -176,9 +176,9 @@ def cmd_run(dry_run):
     client.command("OPTIMIZE TABLE clean.transactions FINAL")  # дедуп ReplacingMergeTree
 
     print("DQ run complete.")
-    q = client.query("SELECT count() FROM raw.quarantine_transactions").result_rows[0][0]
+    q = client.query("SELECT count() FROM raw.quarantine").result_rows[0][0]
     c = client.query("SELECT count() FROM clean.transactions").result_rows[0][0]
-    print(f"  quarantine_transactions: {q}")
+    print(f"  quarantine: {q}")
     print(f"  clean.transactions:      {c}")
     client.close()
 
