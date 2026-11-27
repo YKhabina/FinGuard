@@ -1,0 +1,78 @@
+# ============================================================
+# Antifraud stack — переменные окружения
+# Скопируйте в .env:  cp .env.example .env
+# .env добавлен в .gitignore и НЕ должен попадать в репозиторий.
+# ============================================================
+
+
+# ------------------------------------------------------------
+# Airflow
+# ------------------------------------------------------------
+# UID пользователя, от которого Airflow пишет файлы в ./logs, ./dags
+# Linux/macOS:  AIRFLOW_UID=$(id -u)
+# Windows:      50000
+AIRFLOW_UID=50000
+
+AIRFLOW_ADMIN_USER=admin
+AIRFLOW_ADMIN_PASSWORD=admin
+
+
+# ------------------------------------------------------------
+# PostgreSQL (метаданные Airflow)
+# ------------------------------------------------------------
+POSTGRES_USER=airflow
+POSTGRES_PASSWORD=airflow
+POSTGRES_DB=airflow
+
+
+# ------------------------------------------------------------
+# ClickHouse
+# ------------------------------------------------------------
+# Локально можно оставить пароль пустым (default user без пароля).
+# В проде — задайте пароль и создайте отдельного пользователя grafana_user.
+CLICKHOUSE_USER=default
+CLICKHOUSE_PASSWORD=
+
+
+# ------------------------------------------------------------
+# MinIO
+# ------------------------------------------------------------
+MINIO_ROOT_USER=minioadmin
+MINIO_ROOT_PASSWORD=minioadmin
+
+
+# ------------------------------------------------------------
+# Grafana
+# ------------------------------------------------------------
+GF_SECURITY_ADMIN_USER=admin
+GF_SECURITY_ADMIN_PASSWORD=admin
+
+
+# ------------------------------------------------------------
+# Spark
+# ------------------------------------------------------------
+SPARK_WORKER_MEMORY=2G
+SPARK_WORKER_CORES=2
+
+
+# ------------------------------------------------------------
+# Приложение (используется в скриптах ./jobs)
+# ------------------------------------------------------------
+# ClickHouse для JDBC из PySpark/Airflow
+CLICKHOUSE_HOST=clickhouse
+CLICKHOUSE_PORT=8123
+CLICKHOUSE_DB=default
+
+# MinIO для S3A из PySpark
+MINIO_ENDPOINT=http://minio:9000
+MINIO_BUCKET_RISK=risk-analytics
+MINIO_BUCKET_INV=risk-investigations
+
+# Kafka
+KAFKA_BOOTSTRAP=kafka:9092
+
+# Дата профиля (YYYY-MM-DD); пусто = сегодня
+PROFILE_DATE=
+
+# Порог risk_score для alert_high_risk
+ANTIFRAUD_RISK_THRESHOLD=80
