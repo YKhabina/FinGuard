@@ -1,0 +1,21 @@
+# секреты
+.env
+.env.*
+!.env.example
+
+# данные
+spark-data/
+clickhouse-data/
+postgres-data/
+kafka-data/
+minio-data/
+grafana-data/
+
+# airflow
+logs/
+plugins/__pycache__/
+
+# python
+__pycache__/
+*.pyc
+.venv/
